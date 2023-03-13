@@ -1,41 +1,15 @@
 import { ClientConfiguration, endpoints } from "./client-configuration";
-import {
-  AuthenticationError,
-  AuthorizationError,
-  ClientError,
-  NetworkError,
-  ProtocolError,
-  QueryCheckError,
-  QueryRuntimeError,
-  QueryTimeoutError,
-  ServiceError,
-  ServiceInternalError,
-  ServiceTimeoutError,
-  ThrottlingError,
-} from "./errors";
 import type { QueryBuilder } from "./query-builder";
-import {
-  isQueryFailure,
-  isQuerySuccess,
-  type QueryFailure,
-  type QueryRequest,
-  type QueryRequestHeaders,
-  type QuerySuccess,
+import type {
+  QueryRequest,
+  QueryRequestHeaders,
+  QueryResponse,
 } from "./wire-protocol";
-import {
-  getDefaultHTTPClient,
-  HTTPResponse,
-  isHTTPResponse,
-  type HTTPClient,
-} from "./http-client";
-import { TaggedTypeFormat } from "./tagged-type";
 
-const defaultClientConfiguration: Pick<
-  ClientConfiguration,
-  "endpoint" | "max_conns"
-> = {
-  endpoint: endpoints.cloud,
+const defaultClientConfiguration = {
   max_conns: 10,
+  endpoint: endpoints.cloud,
+  timeout_ms: 60_000,
 };
 
 /**
@@ -43,73 +17,39 @@ const defaultClientConfiguration: Pick<
  */
 export class Client {
   /** The {@link ClientConfiguration} */
-  readonly #clientConfiguration: ClientConfiguration;
-  /** The underlying {@link HTTPClient} client. */
-  readonly #httpClient: HTTPClient;
-  /** The last transaction timestamp this client has seen */
-  #lastTxnTs?: number;
-  /** url of Fauna */
-  #url: string;
+  readonly clientConfiguration: ClientConfiguration;
+  /** last_txn this client has seen */
+  #lastTxn?: Date;
+  readonly headers = {};
 
-  /**
-   * Constructs a new {@link Client}.
-   * @param clientConfiguration - the {@link ClientConfiguration} to apply. Defaults to recommended ClientConfiguraiton.
-   * @param httpClient - The underlying {@link HTTPClient} that will execute the actual HTTP calls. Defaults to recommended HTTPClient.
-   * @example
-   * ```typescript
-   *  const myClient = new Client(
-   *   {
-   *     endpoint: endpoints.cloud,
-   *     max_conns: 10,
-   *     secret: "foo",
-   *     query_timeout_ms: 60_000,
-   *   }
-   * );
-   * ```
-   */
-  constructor(
-    clientConfiguration?: Partial<ClientConfiguration>,
-    httpClient?: HTTPClient
-  ) {
-    this.#clientConfiguration = {
+  constructor(clientConfiguration?: Partial<ClientConfiguration>) {
+    this.clientConfiguration = {
       ...defaultClientConfiguration,
       ...clientConfiguration,
       secret: this.#getSecret(clientConfiguration),
     };
-    this.#url = `${this.clientConfiguration.endpoint.toString()}query/1`;
-    if (!httpClient) {
-      this.#httpClient = getDefaultHTTPClient();
-    } else {
-      this.#httpClient = httpClient;
+
+    this.headers = {
+      Authorization: `Bearer ${this.clientConfiguration.secret}`,
+      "Content-Type": "application/json",
+      "X-Format": "simple",
+    };
+
+    this.#setHeaders(this.clientConfiguration, this.headers);
+  }
+
+  #getSecret(partialClientConfig?: Partial<ClientConfiguration>): string {
+    let fallback = undefined;
+    if (typeof process === "object") {
+      fallback = process.env["FAUNA_SECRET"];
     }
-  }
-
-  /**
-   * @returns the last transaction time seen by this client, or undefined if this client has not seen a transaction time.
-   */
-  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-  // @ts-ignore it's okay that #lastTxnTs could be undefined on get, but we want
-  //   to enforce that the user never intentionally set it to undefined.
-  get lastTxnTs(): number | undefined {
-    return this.#lastTxnTs;
-  }
-  /**
-   * Sets the last transaction time of this client.
-   * @param ts - the last transaction timestamp to set, as microseconds since
-   *   the epoch. If `ts` is less than the existing `#lastTxnTs` value, then no
-   *   change is made.
-   */
-  set lastTxnTs(ts: number) {
-    this.#lastTxnTs = this.#lastTxnTs ? Math.max(ts, this.#lastTxnTs) : ts;
-  }
-
-  /**
-   * Return the {@link ClientConfiguration} of this client, save for the secret.
-   */
-  get clientConfiguration(): Omit<ClientConfiguration, "secret"> {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const { secret, ...rest } = this.#clientConfiguration;
-    return rest;
+    const maybeSecret = partialClientConfig?.secret || fallback;
+    if (maybeSecret === undefined) {
+      throw new Error(
+        `You must provide a secret to the driver. Set it in an environmental variable named FAUNA_SECRET or pass it to the Client constructor.`
+      );
+    }
+    return maybeSecret;
   }
 
   /**
@@ -121,7 +61,7 @@ export class Client {
    *   Values in this headers parameter take precedence over the same values in the request
    *   parameter. This field is primarily intended to be used when you pass a QueryBuilder as
    *   the parameter.
-   * @returns Promise&lt;{@link QuerySuccess}&gt;.
+   * @returns Promise&lt;{@link QueryResponse}&gt;.
    * @throws {@link ServiceError} Fauna emitted an error. The ServiceError will be
    *   one of ServiceError's child classes if the error can be further categorized,
    *   or a concrete ServiceError if it cannot. ServiceError child types are
@@ -139,175 +79,158 @@ export class Client {
   async query<T = any>(
     request: QueryRequest | QueryBuilder,
     headers?: QueryRequestHeaders
-  ): Promise<QuerySuccess<T>> {
+  ): Promise<QueryResponse<T>> {
     if ("query" in request) {
       return this.#query({ ...request, ...headers });
     }
     return this.#query(request.toQuery(headers));
   }
 
-  #getError(e: any): ClientError | NetworkError | ProtocolError | ServiceError {
-    // the error was already handled by the driver
-    if (
-      e instanceof ClientError ||
-      e instanceof NetworkError ||
-      e instanceof ProtocolError ||
-      e instanceof ServiceError
-    ) {
-      return e;
-    }
+  async #query<T = any>(queryRequest: QueryRequest): Promise<QueryResponse<T>> {
+    const { query, arguments: args } = queryRequest;
+    this.#setHeaders(queryRequest, this.headers);
 
-    // the HTTP request succeeded, but there was an error
-    if (isHTTPResponse(e)) {
-      // we got an error from the fauna service
-      if (isQueryFailure(e.body)) {
-        const failure = e.body;
-        const status = e.status;
-        return this.#getServiceError(failure, status);
-      }
-
-      // we got a different error from the protocol layer
-      return new ProtocolError({
-        message: `Response is in an unkown format: ${e.body}`,
-        httpStatus: e.status,
-      });
-    }
-
-    // unknown error
-    return new ClientError(
-      "A client level error occurred. Fauna was not called.",
-      {
-        cause: e,
-      }
-    );
-  }
-
-  #getSecret(partialClientConfig?: Partial<ClientConfiguration>): string {
-    let fallback = undefined;
-    if (typeof process === "object") {
-      fallback = process.env["FAUNA_SECRET"];
-    }
-    const maybeSecret = partialClientConfig?.secret || fallback;
-    if (maybeSecret === undefined) {
-      throw new Error(
-        "You must provide a secret to the driver. Set it \
-in an environmental variable named FAUNA_SECRET or pass it to the Client\
- constructor."
-      );
-    }
-    return maybeSecret;
-  }
-
-  #getServiceError(failure: QueryFailure, httpStatus: number): ServiceError {
-    switch (httpStatus) {
-      case 400:
-        if (
-          httpStatus === 400 &&
-          queryCheckFailureCodes.includes(failure.error.code)
-        ) {
-          return new QueryCheckError(failure, httpStatus);
-        }
-
-        return new QueryRuntimeError(failure, httpStatus);
-      case 401:
-        return new AuthenticationError(failure, httpStatus);
-      case 403:
-        return new AuthorizationError(failure, httpStatus);
-      case 429:
-        return new ThrottlingError(failure, httpStatus);
-      case 440:
-        return new QueryTimeoutError(failure, httpStatus);
-      case 500:
-        return new ServiceInternalError(failure, httpStatus);
-      case 503:
-        return new ServiceTimeoutError(failure, httpStatus);
-      default:
-        return new ServiceError(failure, httpStatus);
-    }
-  }
-
-  async #query<T = any>(queryRequest: QueryRequest): Promise<QuerySuccess<T>> {
     try {
-      const headers = {
-        Authorization: `Bearer ${this.#clientConfiguration.secret}`,
-        // WIP - typecheck should be user configurable, but hard code for now
-        "x-typecheck": "false",
-      };
-      this.#setHeaders(
-        { ...this.clientConfiguration, ...queryRequest },
-        headers
-      );
-
-      const isTaggedFormat =
-        (this.#clientConfiguration.format ?? "tagged") === "tagged" ||
-        queryRequest.format === "tagged";
-      const queryArgs = isTaggedFormat
-        ? TaggedTypeFormat.encode(queryRequest.arguments)
-        : queryRequest.arguments;
-
-      const requestData = {
-        query: queryRequest.query,
-        arguments: queryArgs,
-      };
-
-      const fetchResponse = await this.#httpClient.request({
-        url: this.#url,
-        method: "POST",
-        headers,
-        data: requestData,
-      });
-
-      let parsedResponse: HTTPResponse;
-      try {
-        parsedResponse = {
-          ...fetchResponse,
-          body: isTaggedFormat
-            ? TaggedTypeFormat.decode(fetchResponse.body)
-            : JSON.parse(fetchResponse.body),
-        };
-      } catch (error: unknown) {
-        throw new ProtocolError({
-          message: `Error parsing response as JSON: ${error}`,
-          httpStatus: fetchResponse.status,
+      const result: QueryResponse<T> = await fetch(
+        `${this.clientConfiguration.endpoint.toString()}/query/1`,
+        {
+          method: "POST",
+          headers: this.headers,
+          body: JSON.stringify({ query, arguments: args }),
+          keepalive: true,
+        }
+      )
+        .then(async (res) => res.json())
+        .catch((err) => {
+          throw new Error(err);
         });
-      }
 
-      // Response is not from Fauna
-      if (!isQuerySuccess(parsedResponse.body)) {
-        throw this.#getError(parsedResponse);
-      }
+      // if (result?.errors?.length || result?.error) {
+      //   throw new Error(JSON.stringify(result.errors[0] || result?.error));
+      // }
 
-      const txn_ts = parsedResponse.body.txn_ts;
+      const txn_time = result?.txn_ts;
+      const txnDate = new Date(txn_time);
       if (
-        (this.#lastTxnTs === undefined && txn_ts !== undefined) ||
-        (txn_ts !== undefined &&
-          this.#lastTxnTs !== undefined &&
-          this.#lastTxnTs < txn_ts)
+        (this.#lastTxn === undefined && txn_time !== undefined) ||
+        (txn_time !== undefined &&
+          this.#lastTxn !== undefined &&
+          this.#lastTxn < txnDate)
       ) {
-        this.#lastTxnTs = txn_ts;
+        this.#lastTxn = txnDate;
       }
-
-      return parsedResponse.body as QuerySuccess<T>;
+      return result;
     } catch (e: any) {
-      throw this.#getError(e);
+      // throw this.#getError(e);
+      throw new Error(e);
     }
   }
+
+  // #getError(e: any): ServiceError | ProtocolError | NetworkError | ClientError {
+  //   // see: https://axios-http.com/docs/handling_errors
+  //   if (e.response) {
+  //     // we got an error from the fauna service
+  //     if (e.response.data?.error) {
+  //       const error = e.response.data.error;
+  //       // WIP - summary is moving to a top-level field in the service
+  //       if (
+  //         error.summary === undefined &&
+  //         e.response.data.summary !== undefined
+  //       ) {
+  //         error.summary = e.response.data.summary;
+  //       }
+  //       return this.#getServiceError(error, e.response.status);
+  //     }
+  //     // we got a different error from the protocol layer
+  //     return new ProtocolError({
+  //       message: e.message,
+  //       httpStatus: e.response.status,
+  //     });
+  //   }
+  //   // we're in the browser dealing with an XMLHttpRequest that was never sent
+  //   // OR we're in node dealing with an HTTPClient.Request that never connected
+  //   // OR node or axios hit a network connection problem at a lower level,
+  //   // OR axios threw a network error
+  //   // see: https://nodejs.org/api/errors.html#nodejs-error-codes
+  //   if (
+  //     e.request?.status === 0 ||
+  //     e.request?.socket?.connecting ||
+  //     nodeOrAxiosNetworkErrorCodes.includes(e.code) ||
+  //     "Network Error" === e.message
+  //   ) {
+  //     return new NetworkError("The network connection encountered a problem.", {
+  //       cause: e,
+  //     });
+  //   }
+  //   // unknown error
+  //   return new ClientError(
+  //     "A client level error occurred. Fauna was not called.",
+  //     {
+  //       cause: e,
+  //     }
+  //   );
+  // }
+
+  // #getServiceError(
+  //   error: {
+  //     code: string;
+  //     message: string;
+  //     summary?: string;
+  //     stats?: { [key: string]: number };
+  //     trace?: Array<Span>;
+  //     txn_time?: string;
+  //   },
+  //   httpStatus: number
+  // ): ServiceError {
+  //   if (httpStatus === 401) {
+  //     return new AuthenticationError({ httpStatus, ...error });
+  //   }
+  //   if (httpStatus === 403) {
+  //     return new AuthorizationError({ httpStatus, ...error });
+  //   }
+  //   if (httpStatus === 500) {
+  //     return new ServiceInternalError({ httpStatus, ...error });
+  //   }
+  //   if (httpStatus === 503) {
+  //     return new ServiceTimeoutError({ httpStatus, ...error });
+  //   }
+  //   if (httpStatus === 429) {
+  //     return new ThrottlingError({ httpStatus, ...error });
+  //   }
+  //   if (httpStatus === 440) {
+  //     // TODO stats not yet returned. Include it when it is.
+  //     return new QueryTimeoutError({ httpStatus, ...error });
+  //   }
+  //   // TODO using a list of codes to categorize as QueryCheckError
+  //   // vs QueryRutimeError is brittle and coupled to the service
+  //   // implementation.
+  //   // We need a field sent across the wire that categorizes 400s as either
+  //   // runtime failures or check failures so we are not coupled to the list
+  //   // of codes emitted by the service.
+  //   if (httpStatus === 400 && queryCheckFailureCodes.includes(error.code)) {
+  //     return new QueryCheckError({ httpStatus, ...error });
+  //   } else if (httpStatus === 400) {
+  //     return new QueryRuntimeError({ httpStatus, ...error });
+  //   }
+  //   return new ServiceError({ httpStatus, ...error });
+  // }
 
   #setHeaders(fromObject: QueryRequestHeaders, headerObject: any): void {
     for (const entry of Object.entries(fromObject)) {
       if (
         [
-          "format",
-          "query_timeout_ms",
+          "last_txn",
+          "timeout_ms",
           "linearized",
           "max_contention_retries",
           "traceparent",
-          "query_tags",
+          "tags",
         ].includes(entry[0])
       ) {
         let headerValue: string;
         let headerKey = `x-${entry[0].replaceAll("_", "-")}`;
-        if ("query_tags" === entry[0]) {
+        if ("tags" === entry[0]) {
+          headerKey = "x-fauna-tags";
           headerValue = Object.entries(entry[1])
             .map((tag) => tag.join("="))
             .join(",");
@@ -325,20 +248,39 @@ in an environmental variable named FAUNA_SECRET or pass it to the Client\
       }
     }
     if (
-      headerObject["x-last-txn-ts"] === undefined &&
-      this.#lastTxnTs !== undefined
+      headerObject["x-last-txn"] === undefined &&
+      this.#lastTxn !== undefined
     ) {
-      headerObject["x-last-txn-ts"] = this.#lastTxnTs;
+      headerObject["x-last-txn"] = this.#lastTxn.toISOString();
     }
   }
 }
 
 // Private types and constants for internal logic.
 
-const queryCheckFailureCodes = [
-  "invalid_function_definition",
-  "invalid_identifier",
-  "invalid_query",
-  "invalid_syntax",
-  "invalid_type",
-];
+// const queryCheckFailureCodes = [
+//   "invalid_function_definition",
+//   "invalid_identifier",
+//   "invalid_query",
+//   "invalid_syntax",
+//   "invalid_type",
+// ];
+
+// const nodeOrAxiosNetworkErrorCodes = [
+//   "ECONNABORTED",
+//   "ECONNREFUSED",
+//   "ECONNRESET",
+//   "ERR_NETWORK",
+//   "ETIMEDOUT",
+//   // axios does not yet support http2, but preparing
+//   // in case we move to a library that does or axios
+//   // adds in support.
+//   "ERR_HTTP_REQUEST_TIMEOUT",
+//   "ERR_HTTP2_GOAWAY_SESSION",
+//   "ERR_HTTP2_INVALID_SESSION",
+//   "ERR_HTTP2_INVALID_STREAM",
+//   "ERR_HTTP2_OUT_OF_STREAMS",
+//   "ERR_HTTP2_SESSION_ERROR",
+//   "ERR_HTTP2_STREAM_CANCEL",
+//   "ERR_HTTP2_STREAM_ERROR",
+// ];
