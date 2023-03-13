@@ -99,17 +99,17 @@ export class Client {
           body: JSON.stringify({ query, arguments: args }),
           keepalive: true,
         }
-      )
-        .then(async (res) => res.json())
-        .catch((err) => {
-          throw new Error(err);
-        });
+      ).then(async (res) => res.json());
 
-      // if (result?.errors?.length || result?.error) {
-      //   throw new Error(JSON.stringify(result.errors[0] || result?.error));
-      // }
+      if ("errors" in result) {
+        throw new Error(JSON.stringify(result.errors[0]));
+      }
 
-      const txn_time = result?.txn_ts;
+      if ("error" in result) {
+        throw new Error(JSON.stringify(result?.error));
+      }
+
+      const txn_time = result?.txn_time;
       const txnDate = new Date(txn_time);
       if (
         (this.#lastTxn === undefined && txn_time !== undefined) ||

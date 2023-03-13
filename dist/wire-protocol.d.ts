@@ -65,6 +65,7 @@ export type QueryStats = {
 };
 export type QueryInfo = {
     /** The last transaction timestamp of the query. A Unix epoch in microseconds. */
+    txn_time: string;
     txn_ts: number;
     /** A readable summary of any warnings or logs emitted by the query. */
     summary?: string;
@@ -92,6 +93,9 @@ export type QueryFailure = QueryInfo & {
     /**
      * The result of the query resulting in
      */
+    errors: {
+        code: string;
+    }[];
     error: {
         /** A predefined code which indicates the type of error. See XXX for a list of error codes. */
         code: string;

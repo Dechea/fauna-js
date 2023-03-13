@@ -100,10 +100,14 @@ var Client = class {
           body: JSON.stringify({ query, arguments: args }),
           keepalive: true
         }
-      ).then(async (res) => res.json()).catch((err) => {
-        throw new Error(err);
-      });
-      const txn_time = result?.txn_ts;
+      ).then(async (res) => res.json());
+      if ("errors" in result) {
+        throw new Error(JSON.stringify(result.errors[0]));
+      }
+      if ("error" in result) {
+        throw new Error(JSON.stringify(result?.error));
+      }
+      const txn_time = result?.txn_time;
       const txnDate = new Date(txn_time);
       if (this.#lastTxn === void 0 && txn_time !== void 0 || txn_time !== void 0 && this.#lastTxn !== void 0 && this.#lastTxn < txnDate) {
         this.#lastTxn = txnDate;
